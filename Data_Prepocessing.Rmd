@@ -1,0 +1,1703 @@
+---
+title: "coba sempro"
+author: "Sumayyah Asysyahidah_164221007"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r load library}
+# ============================================
+# 0) SETUP & LIBRARY
+# ============================================
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(readr)
+library(tibble)
+
+START <- as.Date("2017-01-01") 
+END   <- as.Date("2025-12-31")
+
+p_gold <- "C:/Users/IFA/Downloads/skripsii/skripsi/antam_price2.csv"
+p_btc  <- "C:/Users/IFA/Downloads/skripsii/skripsi/Data Historis Bitcoinn.csv"
+p_ihsg <- "C:/Users/IFA/Downloads/skripsii/skripsi/ihsg_daily.csv"
+p_kurs <- "C:/Users/IFA/Downloads/skripsii/skripsi/kurs_transaksi_bi_usd_2017-01-01_2025-12-31.csv"
+
+clip_range <- function(df) {
+  df %>% filter(Date >= START, Date <= END)
+}
+```
+
+# LOAD DATA
+ 
+```{r}
+# ============================================
+# 1) LOAD DATA HARGA: GOLD, BTC, IHSG
+# ============================================
+
+# a) GOLD 
+gold <- fread(p_gold, sep = ";", encoding = "UTF-8")
+if (!all(c("Date","Price") %in% names(gold))) {
+  gold <- fread(p_gold, sep = ",", encoding = "UTF-8")
+}
+stopifnot(all(c("Date","Price") %in% names(gold)))
+
+gold <- gold %>%
+  mutate(
+    Date = dmy(Date),
+    gold = as.numeric(Price)
+  ) %>%
+  select(Date, gold) %>%
+  filter(!is.na(Date), !is.na(gold)) %>%
+  arrange(Date) %>%
+  distinct(Date, .keep_all = TRUE) %>%
+  clip_range()
+
+# b) BTC 
+btc <- fread(p_btc, sep = ";", encoding = "UTF-8")
+stopifnot(all(c("Tanggal","Terakhir") %in% names(btc)))
+
+btc <- btc %>%
+  mutate(
+    Date = dmy(Tanggal),
+    btc_usd = readr::parse_number(
+      as.character(Terakhir),
+      locale = readr::locale(decimal_mark = ",", grouping_mark = ".")
+    )
+  ) %>%
+  select(Date, btc_usd) %>%
+  filter(!is.na(Date),  !is.na(btc_usd)) %>%
+  arrange(Date) %>%
+  distinct(Date, .keep_all = TRUE) %>%
+  clip_range()
+
+# c) IHSG 
+ihsg <- fread(p_ihsg, sep = ",", encoding = "UTF-8")
+
+stopifnot(all(c("Date","ihsg") %in% names(ihsg)))
+
+ihsg <- ihsg %>%
+  mutate(
+    Date = ymd(Date),
+    ihsg = as.numeric(ihsg)
+  ) %>%
+  select(Date, ihsg) %>%
+  filter(!is.na(Date),!is.na(ihsg) ) %>%
+  arrange(Date) %>%
+  distinct(Date, .keep_all = TRUE) %>%
+  clip_range()
+
+ #d) kurs
+kurs <- fread(p_kurs, sep = ";", encoding = "UTF-8")
+setnames(kurs, tolower(names(kurs)))
+stopifnot(all(c("tanggal","kurs_jual","kurs_beli") %in% names(kurs)))
+
+kurs <- kurs %>%
+  mutate(
+    Date = dmy(tanggal),
+    kurs_jual = as.numeric(kurs_jual)/100,
+    kurs_beli = as.numeric(kurs_beli)/100,
+    USDIDR = (kurs_jual + kurs_beli) / 2,
+    IDRUSD = 1 / USDIDR
+  ) %>%
+  select(Date, USDIDR, IDRUSD) %>%
+  filter(!is.na(Date), !is.na(USDIDR), !is.na(IDRUSD)) %>%
+  arrange(Date) %>%
+  distinct(Date, .keep_all = TRUE) %>%
+  clip_range()
+```
+
+```{r}
+head(kurs$kurs_jual, 10)
+```
+
+
+```{r}
+# ============================================
+# 2) MERGE REAL OVERLAP ONLY
+# ============================================
+#conver kurs dan harga btc usd
+df_level <- gold %>% #memastikan setiap variabel terdapat nilainya, apabila tidak ada maka tidak dipakai
+  inner_join(btc,  by = "Date") %>%
+  inner_join(ihsg, by = "Date") %>%
+  inner_join(kurs, by = "Date") %>%
+  arrange(Date) %>%
+  mutate(
+    btc = btc_usd * USDIDR
+  ) %>%
+  select(Date, ihsg, gold, btc, USDIDR, IDRUSD)
+
+cat("=== DATA LEVEL SETELAH MERGE ===\n")
+cat("Rentang tanggal:", as.character(min(df_level$Date)), "→", as.character(max(df_level$Date)), "\n")
+cat("Jumlah observasi:", nrow(df_level), "\n")
+cat("Duplikat Date:", sum(duplicated(df_level$Date)), "\n")
+cat("Missing values:\n")
+print(sapply(df_level, function(x) sum(is.na(x))))
+```
+
+```{r}
+# ============================================
+# 2A) EDA SEBELUM PREPROCESSING
+#    Data level hasil merge
+# ============================================
+
+library(e1071)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(scales)
+
+cat("\n=== EDA SEBELUM PREPROCESSING ===\n")
+
+# Pastikan Date bertipe Date
+df_level <- df_level %>%
+  mutate(Date = as.Date(Date))
+
+cat("Rentang tanggal:", as.character(min(df_level$Date, na.rm = TRUE)), 
+    "→", as.character(max(df_level$Date, na.rm = TRUE)), "\n")
+cat("Jumlah observasi:", nrow(df_level), "\n")
+cat("Duplikat Date:", sum(duplicated(df_level$Date)), "\n")
+
+cat("Missing values:\n")
+print(sapply(df_level, function(x) sum(is.na(x))))
+
+# ============================================
+# STATISTIKA DESKRIPTIF DATA LEVEL
+# ============================================
+
+var_all <- c("ihsg", "gold", "btc", "USDIDR")
+var_all <- var_all[var_all %in% names(df_level)]
+
+var_labels_all <- c(
+  ihsg   = "IHSG",
+  gold   = "Emas",
+  btc    = "Bitcoin",
+  USDIDR = "USD/IDR"
+)
+
+desc_level <- bind_rows(lapply(var_all, function(v) {
+  x <- df_level[[v]]
+  
+  data.frame(
+    Variable     = var_labels_all[[v]],
+    Mean         = mean(x, na.rm = TRUE),
+    Median       = median(x, na.rm = TRUE),
+    Std_Dev      = sd(x, na.rm = TRUE),
+    Min          = min(x, na.rm = TRUE),
+    Max          = max(x, na.rm = TRUE),
+    Skewness     = e1071::skewness(x, na.rm = TRUE, type = 2),
+    Kurtosis     = e1071::kurtosis(x, na.rm = TRUE, type = 2),
+    Observations = sum(!is.na(x))
+  )
+}))
+
+cat("\n=== STATISTIKA DESKRIPTIF DATA LEVEL ===\n")
+print(desc_level)
+
+# ============================================
+# DATA LONG UNTUK VISUALISASI
+# Visualisasi hanya IHSG, Emas, dan Bitcoin
+# ============================================
+
+var_plot <- c("ihsg", "gold", "btc")
+
+var_labels_plot <- c(
+  ihsg = "IHSG",
+  gold = "Emas",
+  btc  = "Bitcoin"
+)
+
+df_level_long <- df_level %>%
+  select(Date, all_of(var_plot)) %>%
+  pivot_longer(
+    cols = -Date,
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Variable = recode(Variable, !!!var_labels_plot),
+    Variable = factor(Variable, levels = c("IHSG", "Emas", "Bitcoin"))
+  )
+
+# ============================================
+# WARNA SETIAP ASET
+# ============================================
+
+asset_cols <- c(
+  "IHSG"    = "#2F5597",
+  "Emas"    = "#C9A227",
+  "Bitcoin" = "#F28E2B"
+)
+
+# ============================================
+# TEMA GRAFIK UNTUK SKRIPSI A4
+# ============================================
+
+theme_eda <- theme_minimal(base_size = 9) +
+  theme(
+    plot.title = element_blank(),
+    strip.text = element_text(face = "bold", size = 9),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    panel.spacing = grid::unit(0.35, "lines"),
+    legend.position = "none",
+    plot.margin = margin(4, 4, 4, 4)
+  )
+
+# ============================================
+# 1) LINE CHART DATA LEVEL
+# ============================================
+
+p_level_line <- ggplot(df_level_long, aes(x = Date, y = Value, color = Variable)) +
+  geom_line(linewidth = 0.35, alpha = 0.9) +
+  facet_wrap(~Variable, scales = "free_y", ncol = 1) +
+  scale_color_manual(values = asset_cols) +
+  scale_x_date(
+    date_breaks = "1 year",
+    date_labels = "%Y",
+    expand = expansion(mult = c(0.01, 0.08))
+  ) +
+  scale_y_continuous(
+    labels = label_number(
+      big.mark = ".",
+      decimal.mark = ",",
+      accuracy = 1
+    )
+  ) +
+  labs(
+    x = "Tahun",
+    y = "Nilai Data Asli"
+  ) +
+  theme_eda
+
+print(p_level_line)
+
+# ============================================
+# 2) BOXPLOT DATA LEVEL
+# ============================================
+
+p_level_box <- ggplot(df_level_long, aes(x = Variable, y = Value, fill = Variable)) +
+  geom_boxplot(
+    width = 0.45,
+    alpha = 0.85,
+    outlier.size = 0.7,
+    outlier.alpha = 0.45
+  ) +
+  facet_wrap(~Variable, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = asset_cols) +
+  scale_y_continuous(
+    labels = label_number(
+      big.mark = ".",
+      decimal.mark = ",",
+      accuracy = 1
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Nilai Data Asli"
+  ) +
+  theme_eda +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+print(p_level_box)
+
+# ============================================
+# 3) HISTOGRAM DATA LEVEL
+# ============================================
+
+p_level_hist <- ggplot(df_level_long, aes(x = Value, fill = Variable)) +
+  geom_histogram(
+    bins = 30,
+    color = "white",
+    alpha = 0.85
+  ) +
+  facet_wrap(~Variable, scales = "free", ncol = 1) +
+  scale_fill_manual(values = asset_cols) +
+  scale_x_continuous(
+    labels = label_number(
+      big.mark = ".",
+      decimal.mark = ",",
+      accuracy = 1
+    )
+  ) +
+  labs(
+    x = "Nilai Data Asli",
+    y = "Frekuensi"
+  ) +
+  theme_eda
+
+print(p_level_hist)
+
+# ============================================
+# KORELASI DATA LEVEL
+# ============================================
+
+cor_level <- df_level %>%
+  select(all_of(var_all)) %>%
+  cor(use = "complete.obs", method = "pearson")
+
+cat("\n=== KORELASI DATA LEVEL SEBELUM PREPROCESSING ===\n")
+print(round(cor_level, 4))
+
+# ============================================
+# SIMPAN OUTPUT VISUALISASI KE PNG
+# Ukuran disesuaikan untuk dokumen A4
+# ============================================
+
+getwd()
+
+out_dir <- "output_visual_eda"
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir)
+}
+
+ggsave(
+  filename = file.path(out_dir, "line_chart_data_level.png"),
+  plot = p_level_line,
+  width = 13,
+  height = 14,
+  units = "cm",
+  dpi = 300,
+  bg = "white"
+)
+
+# Boxplot: lebih pendek karena hanya satu baris panel
+ggsave(
+  filename = file.path(out_dir, "boxplot_data_level.png"),
+  plot = p_level_box,
+  width = 13,
+  height = 7,
+  units = "cm",
+  dpi = 300,
+  bg = "white"
+)
+
+# Histogram: tinggi sedang agar panel tetap terbaca
+ggsave(
+  filename = file.path(out_dir, "histogram_data_level.png"),
+  plot = p_level_hist,
+  width = 13,
+  height = 14,
+  units = "cm",
+  dpi = 300,
+  bg = "white"
+)
+
+cat("\n=== FILE PNG BERHASIL DISIMPAN DI FOLDER: ", out_dir, " ===\n")
+
+
+```
+
+```{r}
+desc_table_before <- data.frame(
+  
+  Variable = c("IHSG", "Gold", "Bitcoin"),
+  
+  Mean = c(
+    mean(df_level$ihsg, na.rm = TRUE),
+    mean(df_level$gold, na.rm = TRUE),
+    mean(df_level$btc, na.rm = TRUE)
+  ),
+  
+  Median = c(
+    median(df_level$ihsg, na.rm = TRUE),
+    median(df_level$gold, na.rm = TRUE),
+    median(df_level$btc, na.rm = TRUE)
+  ),
+  
+  Std_Dev = c(
+    sd(df_level$ihsg, na.rm = TRUE),
+    sd(df_level$gold, na.rm = TRUE),
+    sd(df_level$btc, na.rm = TRUE)
+  ),
+  
+  Min = c(
+    min(df_level$ihsg, na.rm = TRUE),
+    min(df_level$gold, na.rm = TRUE),
+    min(df_level$btc, na.rm = TRUE)
+  ),
+  
+  Max = c(
+    max(df_level$ihsg, na.rm = TRUE),
+    max(df_level$gold, na.rm = TRUE),
+    max(df_level$btc, na.rm = TRUE)
+  ),
+  
+  Skewness = c(
+    e1071::skewness(df_level$ihsg, na.rm = TRUE),
+    e1071::skewness(df_level$gold, na.rm = TRUE),
+    e1071::skewness(df_level$btc, na.rm = TRUE)
+  ),
+  
+  Kurtosis = c(
+    e1071::kurtosis(df_level$ihsg, na.rm = TRUE),
+    e1071::kurtosis(df_level$gold, na.rm = TRUE),
+    e1071::kurtosis(df_level$btc, na.rm = TRUE)
+  ),
+  
+  Observations = c(
+    sum(!is.na(df_level$ihsg)),
+    sum(!is.na(df_level$gold)),
+    sum(!is.na(df_level$btc))
+  )
+)
+
+desc_table_before
+```
+
+
+```{r}
+# ============================================
+# 3) REINDEX KE BUSINESS DAYS (SENIN-JUMAT)
+# ============================================
+
+all_days <- seq(from = START, to = END, by = "day")
+idxB <- all_days[!wday(all_days) %in% c(1, 7)]   # 1=Sunday, 7=Saturday
+
+dfB <- tibble(Date = idxB) %>%
+  left_join(df_level, by = "Date") %>%
+  arrange(Date)
+
+cat("\n=== SETELAH REINDEX BUSINESS DAYS ===\n")
+cat("Rentang tanggal:", as.character(min(dfB$Date)), "→", as.character(max(dfB$Date)), "\n")
+cat("Jumlah observasi:", nrow(dfB), "\n")
+cat("Missing awal:\n")
+print(sapply(dfB[, c("ihsg","gold","btc","USDIDR","IDRUSD")], function(x) sum(is.na(x))))
+
+# ============================================
+# 4) IMPUTASI: HANYA FORWARD FILL
+#    TANPA INTERPOLASI LINEAR
+# ============================================
+
+df_imp <- dfB
+
+# forward fill untuk semua seri
+for (cc in c("ihsg","gold","btc","USDIDR","IDRUSD")) {
+  df_imp[[cc]] <- zoo::na.locf(df_imp[[cc]], na.rm = FALSE)
+}
+
+# recalculate IDRUSD dari USDIDR supaya konsisten
+df_imp <- df_imp %>%
+  mutate(
+    IDRUSD = 1 / USDIDR
+  )
+
+# jika ada leading NA di awal, buang
+df_imp <- df_imp %>%
+  filter(!is.na(ihsg), !is.na(gold), !is.na(btc), !is.na(USDIDR), !is.na(IDRUSD)) %>%
+  arrange(Date)
+
+cat("\n=== SETELAH FORWARD FILL ===\n")
+cat("Rentang tanggal:", as.character(min(df_imp$Date)), "→", as.character(max(df_imp$Date)), "\n")
+cat("Jumlah observasi:", nrow(df_imp), "\n")
+cat("Missing setelah fill:\n")
+print(sapply(df_imp[, c("ihsg","gold","btc","USDIDR","IDRUSD")], function(x) sum(is.na(x))))
+
+# ============================================
+# 3) SANITASI UNTUK RETURN
+# ============================================
+df_imp <- df_imp %>%
+  mutate(
+    ihsg = as.numeric(ihsg),
+    gold = as.numeric(gold),
+    btc  = as.numeric(btc),
+    USDIDR = as.numeric(USDIDR),
+    IDRUSD = as.numeric(IDRUSD)
+  ) %>%
+  filter(
+    ihsg > 0,
+    gold > 0,
+    btc  > 0,
+    USDIDR > 0,
+    IDRUSD > 0
+  ) %>%
+  arrange(Date)
+
+cat("\n=== SETELAH SANITASI ===\n")
+cat("Jumlah observasi:", nrow(df_imp), "\n")
+cat("Nilai 0:\n")
+print(c(
+  ihsg = sum(df_imp$ihsg == 0, na.rm = TRUE),
+  gold = sum(df_imp$gold == 0, na.rm = TRUE),
+  btc  = sum(df_imp$btc  == 0, na.rm = TRUE)
+))
+# ============================================
+# 4) HITUNG LOG-RETURN (%)
+# ============================================
+
+rets <- df_imp %>%
+  mutate(
+    ihsg = 100 * (log(ihsg)    - lag(log(ihsg))),
+    gold = 100 * (log(gold)    - lag(log(gold))),
+    btc  = 100 * (log(btc)     - lag(log(btc)))
+  ) %>%
+  select(Date, ihsg, gold, btc) %>%
+  filter(!is.na(ihsg), !is.na(gold), !is.na(btc)) %>%
+  arrange(Date)
+
+cat("\n=== DATA RETURN FINAL ===\n")
+cat("Rentang tanggal:", as.character(min(rets$Date)), "→", as.character(max(rets$Date)), "\n")
+cat("Jumlah observasi:", nrow(rets), "\n")
+cat("Duplikat Date:", sum(duplicated(rets$Date)), "\n")
+cat("Missing values:\n")
+print(sapply(rets, function(x) sum(is.na(x))))
+
+cat("\nPreview returns (5 baris):\n")
+print(head(rets, 5)) 
+```
+
+```{r}
+library(e1071)
+desc_table <- data.frame(
+  
+  Variable = c("IHSG", "Gold", "Bitcoin"),
+  
+  Mean = c(
+    mean(rets$ihsg),
+    mean(rets$gold),
+    mean(rets$btc)
+  ),
+  
+  Median = c(
+    median(rets$ihsg),
+    median(rets$gold),
+    median(rets$btc)
+  ),
+  
+  Std_Dev = c(
+    sd(rets$ihsg),
+    sd(rets$gold),
+    sd(rets$btc)
+  ),
+  
+  Min = c(
+    min(rets$ihsg),
+    min(rets$gold),
+    min(rets$btc)
+  ),
+  
+  Max = c(
+    max(rets$ihsg),
+    max(rets$gold),
+    max(rets$btc)
+  ),
+  
+  Skewness = c(
+    e1071::skewness(rets$ihsg),
+    e1071::skewness(rets$gold),
+    e1071::skewness(rets$btc)
+  ),
+  
+  Kurtosis = c(
+    e1071::kurtosis(rets$ihsg),
+    e1071::kurtosis(rets$gold),
+    e1071::kurtosis(rets$btc)
+  ),
+  
+  Observations = nrow(rets)
+)
+
+desc_table
+```
+
+```{r}
+# ============================================
+# EDA RETURN IHSG, EMAS, DAN BITCOIN
+# ============================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(zoo)
+
+# Pastikan Date bertipe Date
+rets <- rets %>%
+  mutate(Date = as.Date(Date))
+
+# ============================================
+# DATA LONG RETURN
+# ============================================
+
+rets_long <- rets %>%
+  select(Date, ihsg, gold, btc) %>%
+  pivot_longer(
+    cols = c(ihsg, gold, btc),
+    names_to = "Asset",
+    values_to = "Return"
+  ) %>%
+  mutate(
+    Asset = recode(
+      Asset,
+      ihsg = "IHSG",
+      gold = "Emas",
+      btc  = "Bitcoin"
+    ),
+    Asset = factor(Asset, levels = c("IHSG", "Emas", "Bitcoin"))
+  )
+
+# ============================================
+# WARNA ASET
+# ============================================
+
+asset_cols <- c(
+  "IHSG"    = "#2C7BB6",
+  "Emas"    = "#FDB813",
+  "Bitcoin" = "#F46D43"
+)
+
+theme_return <- theme_minimal(base_size = 9) +
+  theme(
+    plot.title = element_blank(),
+    strip.text = element_text(face = "bold", size = 9),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    panel.spacing = grid::unit(0.35, "lines"),
+    legend.position = "none",
+    plot.margin = margin(4, 4, 4, 4)
+  )
+
+# ============================================
+# 1) BOXPLOT RETURN
+# ============================================
+
+p_return_box <- ggplot(rets_long, aes(x = Asset, y = Return, fill = Asset)) +
+  geom_boxplot(
+    width = 0.45,
+    alpha = 0.80,
+    outlier.color = "red",
+    outlier.size = 0.8,
+    outlier.alpha = 0.55
+  ) +
+  facet_wrap(~Asset, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = asset_cols) +
+  scale_y_continuous(
+    labels = label_number(
+      decimal.mark = ",",
+      big.mark = ".",
+      accuracy = 0.1
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Return (%)"
+  ) +
+  theme_return +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+print(p_return_box)
+
+# ============================================
+# 2) LINE CHART RETURN
+#    Tidak ditumpuk dalam satu panel
+# ============================================
+
+p_return_line <- ggplot(rets_long, aes(x = Date, y = Return, color = Asset)) +
+  geom_line(linewidth = 0.35, alpha = 0.9) +
+  facet_wrap(~Asset, ncol = 1, scales = "free_y") +
+  scale_color_manual(values = asset_cols) +
+  scale_x_date(
+    date_breaks = "1 year",
+    date_labels = "%Y",
+    expand = expansion(mult = c(0.01, 0.08))
+  ) +
+  scale_y_continuous(
+    labels = label_number(
+      decimal.mark = ",",
+      big.mark = ".",
+      accuracy = 0.1
+    )
+  ) +
+  labs(
+    x = "Tahun",
+    y = "Return (%)"
+  ) +
+  theme_return
+
+print(p_return_line)
+
+# ============================================
+# 3) HISTOGRAM RETURN + GARIS DISTRIBUSI
+# ============================================
+
+p_return_hist <- ggplot(rets_long, aes(x = Return, fill = Asset)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 50,
+    color = "white",
+    alpha = 0.65
+  ) +
+  geom_density(
+    aes(color = Asset),
+    linewidth = 0.75,
+    adjust = 1.1
+  ) +
+  facet_wrap(~Asset, scales = "free", ncol = 1) +
+  scale_fill_manual(values = asset_cols) +
+  scale_color_manual(values = asset_cols) +
+  scale_x_continuous(
+    labels = label_number(
+      decimal.mark = ",",
+      big.mark = ".",
+      accuracy = 0.1
+    )
+  ) +
+  labs(
+    x = "Return (%)",
+    y = "Kepadatan"
+  ) +
+  theme_return +
+  theme(
+    panel.grid.major.x = element_line(color = "grey85", linewidth = 0.25),
+    panel.grid.major.y = element_line(color = "grey85", linewidth = 0.25)
+  )
+
+print(p_return_hist)
+
+# ============================================
+# 4) HEATMAP KORELASI RETURN
+# ============================================
+
+cor_matrix <- rets %>%
+  select(ihsg, gold, btc) %>%
+  cor(use = "complete.obs", method = "pearson")
+
+rownames(cor_matrix) <- c("IHSG", "Emas", "Bitcoin")
+colnames(cor_matrix) <- c("IHSG", "Emas", "Bitcoin")
+
+cor_long <- as.data.frame(as.table(cor_matrix)) %>%
+  rename(
+    Asset_1 = Var1,
+    Asset_2 = Var2,
+    Correlation = Freq
+  ) %>%
+  mutate(
+    Correlation_show = ifelse(abs(Correlation) < 0.005, 0, Correlation),
+    Label = sprintf("%.2f", Correlation_show),
+    Label = gsub("\\.", ",", Label),
+    TextColor = ifelse(abs(Correlation_show) >= 0.60, "white", "black"),
+    Asset_1 = factor(Asset_1, levels = c("IHSG", "Emas", "Bitcoin")),
+    Asset_2 = factor(Asset_2, levels = c("IHSG", "Emas", "Bitcoin"))
+  )
+p_return_cor <- ggplot(cor_long, aes(x = Asset_1, y = Asset_2, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(
+    aes(label = Label, color = TextColor),
+    size = 3.2,
+    fontface = "bold"
+  ) +
+  scale_color_identity() +
+  scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "white",
+    high = "#D7191C",
+    midpoint = 0,
+    limits = c(-1, 1),
+    name = "Korelasi"
+  ) +
+  coord_fixed() +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    plot.title = element_blank(),
+    axis.text = element_text(size = 9, face = "bold"),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7),
+    plot.margin = margin(4, 4, 4, 4)
+  )
+
+print(p_return_cor)
+
+out_dir <- "output_visual_return"
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir)
+}
+
+ggsave(
+  filename = file.path(out_dir, "boxplot_return.png"),
+  plot = p_return_box,
+  width = 13,
+  height = 6.5,
+  units = "cm",
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(out_dir, "line_chart_return.png"),
+  plot = p_return_line,
+  width = 13,
+  height = 12,
+  units = "cm",
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(out_dir, "histogram_density_return.png"),
+  plot = p_return_hist,
+  width = 13,
+  height = 12,
+  units = "cm",
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(out_dir, "heatmap_korelasi_return.png"),
+  plot = p_return_cor,
+  width = 10,
+  height = 8,
+  units = "cm",
+  dpi = 300,
+  bg = "white"
+)
+
+cat("\n=== FILE PNG BERHASIL DISIMPAN DI FOLDER:", out_dir, "===\n")
+```
+
+```{r}
+library(zoo)
+
+rets$vol_btc <- rollapply(abs(rets$btc), 30, mean, fill=NA)
+
+plot(rets$Date, rets$vol_btc, type="l")
+```
+
+```{r}
+# ============================================
+# (A) UNIT ROOT: ADF, KPSS, ZIVOT-ANDREWS
+#     HANYA UNTUK DATA RETURN
+#     DENGAN CRITICAL VALUE + P-VALUE APPROX
+#     BREAK POINT HANYA UNTUK ZIVOT-ANDREWS
+# ============================================
+
+library(urca)
+library(dplyr)
+
+core_cols <- c("ihsg", "gold", "btc")
+
+# ============================================
+# FUNGSI BANTU P-VALUE APPROX
+# ============================================
+
+pvalue_approx <- function(stat, cv_1, cv_5, cv_10, test_type) {
+
+  if (test_type %in% c("ADF", "ZA")) {
+
+    # ADF dan ZA merupakan lower-tail test
+    # Semakin negatif statistik, semakin kuat menolak H0
+
+    if (stat <= cv_1) {
+      return(0.01)
+
+    } else if (stat >= cv_10) {
+      return(0.10)
+
+    } else {
+      return(
+        approx(
+          x = c(cv_1, cv_5, cv_10),
+          y = c(0.01, 0.05, 0.10),
+          xout = stat
+        )$y
+      )
+    }
+  }
+
+  if (test_type == "KPSS") {
+
+    # KPSS merupakan upper-tail test
+    # Semakin besar statistik, semakin kuat menolak H0
+
+    if (stat >= cv_1) {
+      return(0.01)
+
+    } else if (stat <= cv_10) {
+      return(0.10)
+
+    } else {
+      return(
+        approx(
+          x = c(cv_10, cv_5, cv_1),
+          y = c(0.10, 0.05, 0.01),
+          xout = stat
+        )$y
+      )
+    }
+  }
+}
+
+pvalue_range <- function(stat, cv_1, cv_5, cv_10, test_type) {
+
+  if (test_type %in% c("ADF", "ZA")) {
+
+    if (stat <= cv_1) {
+      return("p <= 0.01")
+
+    } else if (stat <= cv_5) {
+      return("0.01 < p <= 0.05")
+
+    } else if (stat <= cv_10) {
+      return("0.05 < p <= 0.10")
+
+    } else {
+      return("p > 0.10")
+    }
+  }
+
+  if (test_type == "KPSS") {
+
+    if (stat >= cv_1) {
+      return("p <= 0.01")
+
+    } else if (stat >= cv_5) {
+      return("0.01 < p <= 0.05")
+
+    } else if (stat >= cv_10) {
+      return("0.05 < p <= 0.10")
+
+    } else {
+      return("p > 0.10")
+    }
+  }
+}
+
+# ============================================
+# RETURN DATA
+# ============================================
+
+returns_mat <- rets %>%
+  arrange(Date) %>%
+  transmute(
+    Date = as.Date(Date),
+    ihsg = as.numeric(ihsg),
+    gold = as.numeric(gold),
+    btc  = as.numeric(btc)
+  )
+
+# ============================================
+# FUNCTION UNIT ROOT TEST
+# ============================================
+
+unit_root_tests <- function(
+    x,
+    dates,
+    name = "series",
+    adf_type = "drift",
+    kpss_type = "mu",
+    za_model = "both"
+) {
+
+  x <- as.numeric(x)
+  dates <- as.Date(dates)
+
+  # Menghapus NA pada data dan tanggal secara bersamaan
+  valid_data <- complete.cases(x, dates)
+
+  x <- x[valid_data]
+  dates <- dates[valid_data]
+
+  n <- length(x)
+
+  cat("\n============================\n")
+  cat("UNIT ROOT untuk:", name, "\n")
+  cat("N =", n, "\n")
+  cat("============================\n")
+
+  k_adf <- floor((n - 1)^(1 / 3))
+
+  hasil_ringkas <- data.frame()
+  hasil_break_za <- data.frame()
+
+  # =====================================================
+  # 1. ADF TEST
+  # =====================================================
+
+  cat("\n[ADF TEST]\n")
+
+  tryCatch({
+
+    adf_res <- ur.df(
+      y = x,
+      type = adf_type,
+      lags = k_adf,
+      selectlags = "Fixed"
+    )
+
+    tau_name <- switch(
+      adf_type,
+      "none"  = "tau1",
+      "drift" = "tau2",
+      "trend" = "tau3"
+    )
+
+    adf_stat <- as.numeric(adf_res@teststat[1, tau_name])
+    adf_cv   <- adf_res@cval[tau_name, ]
+
+    adf_cv_1pct  <- as.numeric(adf_cv["1pct"])
+    adf_cv_5pct  <- as.numeric(adf_cv["5pct"])
+    adf_cv_10pct <- as.numeric(adf_cv["10pct"])
+
+    adf_p_value <- pvalue_approx(
+      stat = adf_stat,
+      cv_1 = adf_cv_1pct,
+      cv_5 = adf_cv_5pct,
+      cv_10 = adf_cv_10pct,
+      test_type = "ADF"
+    )
+
+    adf_p_range <- pvalue_range(
+      stat = adf_stat,
+      cv_1 = adf_cv_1pct,
+      cv_5 = adf_cv_5pct,
+      cv_10 = adf_cv_10pct,
+      test_type = "ADF"
+    )
+
+    keputusan_adf <- ifelse(
+      adf_stat <= adf_cv_5pct,
+      "Tolak H0: stasioner",
+      "Gagal tolak H0: mengandung unit root"
+    )
+
+    cat("ADF type          :", adf_type, "\n")
+    cat("ADF statistic     :", adf_stat, "\n")
+    cat("ADF p-value       :", round(adf_p_value, 4), "\n")
+    cat("ADF p-value range :", adf_p_range, "\n")
+    cat("ADF lag used      :", k_adf, "\n")
+    cat("ADF CV 1%         :", adf_cv_1pct, "\n")
+    cat("ADF CV 5%         :", adf_cv_5pct, "\n")
+    cat("ADF CV 10%        :", adf_cv_10pct, "\n")
+    cat("Keputusan 5%      :", keputusan_adf, "\n")
+
+    hasil_ringkas <- rbind(
+      hasil_ringkas,
+      data.frame(
+        Variable = name,
+        Test = "ADF",
+        Statistic = adf_stat,
+        P_value = adf_p_value,
+        P_value_range = adf_p_range,
+        CV_1pct = adf_cv_1pct,
+        CV_5pct = adf_cv_5pct,
+        CV_10pct = adf_cv_10pct,
+        Decision_5pct = keputusan_adf,
+        stringsAsFactors = FALSE
+      )
+    )
+
+  }, error = function(e) {
+    cat("ADF gagal:", e$message, "\n")
+  })
+
+  # =====================================================
+  # 2. KPSS TEST
+  # =====================================================
+
+  cat("\n[KPSS TEST]\n")
+
+  tryCatch({
+
+    kpss_res <- ur.kpss(
+      y = x,
+      type = kpss_type,
+      lags = "long"
+    )
+
+    kpss_stat <- as.numeric(kpss_res@teststat)
+    kpss_cv   <- kpss_res@cval[1, ]
+
+    kpss_cv_1pct  <- as.numeric(kpss_cv["1pct"])
+    kpss_cv_5pct  <- as.numeric(kpss_cv["5pct"])
+    kpss_cv_10pct <- as.numeric(kpss_cv["10pct"])
+
+    kpss_p_value <- pvalue_approx(
+      stat = kpss_stat,
+      cv_1 = kpss_cv_1pct,
+      cv_5 = kpss_cv_5pct,
+      cv_10 = kpss_cv_10pct,
+      test_type = "KPSS"
+    )
+
+    kpss_p_range <- pvalue_range(
+      stat = kpss_stat,
+      cv_1 = kpss_cv_1pct,
+      cv_5 = kpss_cv_5pct,
+      cv_10 = kpss_cv_10pct,
+      test_type = "KPSS"
+    )
+
+    keputusan_kpss <- ifelse(
+      kpss_stat >= kpss_cv_5pct,
+      "Tolak H0: tidak stasioner",
+      "Gagal tolak H0: stasioner"
+    )
+
+    cat("KPSS type          :", kpss_type, "\n")
+    cat("KPSS lag type      : long\n")
+    cat("KPSS statistic     :", kpss_stat, "\n")
+    cat("KPSS p-value       :", round(kpss_p_value, 4), "\n")
+    cat("KPSS p-value range :", kpss_p_range, "\n")
+    cat("KPSS CV 1%         :", kpss_cv_1pct, "\n")
+    cat("KPSS CV 5%         :", kpss_cv_5pct, "\n")
+    cat("KPSS CV 10%        :", kpss_cv_10pct, "\n")
+    cat("Keputusan 5%       :", keputusan_kpss, "\n")
+
+    hasil_ringkas <- rbind(
+      hasil_ringkas,
+      data.frame(
+        Variable = name,
+        Test = "KPSS",
+        Statistic = kpss_stat,
+        P_value = kpss_p_value,
+        P_value_range = kpss_p_range,
+        CV_1pct = kpss_cv_1pct,
+        CV_5pct = kpss_cv_5pct,
+        CV_10pct = kpss_cv_10pct,
+        Decision_5pct = keputusan_kpss,
+        stringsAsFactors = FALSE
+      )
+    )
+
+  }, error = function(e) {
+    cat("KPSS gagal:", e$message, "\n")
+  })
+
+  # =====================================================
+  # 3. ZIVOT-ANDREWS TEST
+  # =====================================================
+
+  cat("\n[ZIVOT-ANDREWS TEST]\n")
+
+  tryCatch({
+
+    za_res <- ur.za(
+      y = x,
+      model = za_model,
+      lag = k_adf
+    )
+
+    za_stat <- unname(as.numeric(za_res@teststat))
+    za_cv   <- unname(as.numeric(za_res@cval))
+
+    za_cv_1pct  <- za_cv[1]
+    za_cv_5pct  <- za_cv[2]
+    za_cv_10pct <- za_cv[3]
+
+    # Break point Zivot-Andrews
+    za_break_index <- as.integer(za_res@bpoint)
+
+    za_break_date <- if (
+      length(za_break_index) == 1 &&
+      !is.na(za_break_index) &&
+      za_break_index >= 1 &&
+      za_break_index <= length(dates)
+    ) {
+      dates[za_break_index]
+    } else {
+      as.Date(NA)
+    }
+
+    za_break_value <- if (
+      length(za_break_index) == 1 &&
+      !is.na(za_break_index) &&
+      za_break_index >= 1 &&
+      za_break_index <= length(x)
+    ) {
+      x[za_break_index]
+    } else {
+      NA_real_
+    }
+
+    za_p_value <- pvalue_approx(
+      stat = za_stat,
+      cv_1 = za_cv_1pct,
+      cv_5 = za_cv_5pct,
+      cv_10 = za_cv_10pct,
+      test_type = "ZA"
+    )
+
+    za_p_range <- pvalue_range(
+      stat = za_stat,
+      cv_1 = za_cv_1pct,
+      cv_5 = za_cv_5pct,
+      cv_10 = za_cv_10pct,
+      test_type = "ZA"
+    )
+
+    keputusan_za <- ifelse(
+      za_stat <= za_cv_5pct,
+      "Tolak H0: stasioner dengan structural break",
+      "Gagal tolak H0: mengandung unit root"
+    )
+
+    cat("ZA model          :", za_model, "\n")
+    cat("ZA statistic      :", za_stat, "\n")
+    cat("ZA p-value        :", round(za_p_value, 4), "\n")
+    cat("ZA p-value range  :", za_p_range, "\n")
+    cat("ZA lag used       :", k_adf, "\n")
+    cat("ZA CV 1%          :", za_cv_1pct, "\n")
+    cat("ZA CV 5%          :", za_cv_5pct, "\n")
+    cat("ZA CV 10%         :", za_cv_10pct, "\n")
+    cat("Break point index :", za_break_index, "\n")
+    cat(
+      "Break point date  :",
+      ifelse(
+        is.na(za_break_date),
+        NA,
+        format(za_break_date, "%Y-%m-%d")
+      ),
+      "\n"
+    )
+    cat("Break point value :", za_break_value, "\n")
+    cat("Keputusan 5%      :", keputusan_za, "\n")
+
+    hasil_ringkas <- rbind(
+      hasil_ringkas,
+      data.frame(
+        Variable = name,
+        Test = "Zivot-Andrews",
+        Statistic = za_stat,
+        P_value = za_p_value,
+        P_value_range = za_p_range,
+        CV_1pct = za_cv_1pct,
+        CV_5pct = za_cv_5pct,
+        CV_10pct = za_cv_10pct,
+        Decision_5pct = keputusan_za,
+        stringsAsFactors = FALSE
+      )
+    )
+
+    hasil_break_za <- data.frame(
+      Variable = name,
+      ZA_model = za_model,
+      Break_point_index = za_break_index,
+      Break_point_date = za_break_date,
+      Break_point_value = za_break_value,
+      stringsAsFactors = FALSE
+    )
+
+  }, error = function(e) {
+    cat("Zivot-Andrews gagal:", e$message, "\n")
+  })
+
+  return(
+    list(
+      hasil_unit_root = hasil_ringkas,
+      hasil_break_za = hasil_break_za
+    )
+  )
+}
+
+# ============================================
+# TEST RETURNS ONLY
+# ============================================
+
+cat("\n\n===== UNIT ROOT TEST: RETURNS =====\n")
+
+hasil_unit_root <- data.frame()
+hasil_breakpoint_za <- data.frame()
+
+for (col in core_cols) {
+
+  hasil_col <- unit_root_tests(
+    x = returns_mat[[col]],
+    dates = returns_mat$Date,
+    name = paste(col, "return"),
+    adf_type = "drift",
+    kpss_type = "mu",
+    za_model = "both"
+  )
+
+  hasil_unit_root <- rbind(
+    hasil_unit_root,
+    hasil_col$hasil_unit_root
+  )
+
+  hasil_breakpoint_za <- rbind(
+    hasil_breakpoint_za,
+    hasil_col$hasil_break_za
+  )
+}
+
+rownames(hasil_unit_root) <- NULL
+rownames(hasil_breakpoint_za) <- NULL
+
+# ============================================
+# TABEL RINGKAS HASIL UNIT ROOT
+# ============================================
+
+cat("\n\n===== TABEL RINGKAS UNIT ROOT TEST =====\n")
+print(hasil_unit_root)
+
+# ============================================
+# TABEL BREAK POINT ZIVOT-ANDREWS
+# ============================================
+
+cat("\n\n===== BREAK POINT ZIVOT-ANDREWS =====\n")
+print(hasil_breakpoint_za)
+```
+
+```{r}
+# ============================================
+# (B) VAR BASELINE
+# ============================================
+
+library(vars)
+
+# gunakan data return yang sudah stasioner
+data_var <- returns_mat %>%
+  dplyr::select(-Date) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.numeric)) %>%
+  na.omit() %>%
+  dplyr::filter(dplyr::if_all(dplyr::everything(), is.finite))
+
+cat("Jumlah observasi VAR:", nrow(data_var), "\n")
+cat("Jumlah variabel:", ncol(data_var), "\n")
+#============================================
+# PEMILIHAN LAG OPTIMAL
+# ============================================
+
+lag_res <- VARselect(
+  data_var,
+  lag.max = 12,
+  type = "const"
+)
+
+print(lag_res)
+
+cat("\nLag optimal berdasarkan:\n")
+print(lag_res$selection)
+
+# pilih lag berdasarkan AIC
+p_var <- as.numeric(lag_res$selection["AIC(n)"])
+
+cat("\nLag VAR dipilih (AIC):", p_var, "\n")
+
+# ============================================
+# ESTIMASI VAR
+# ============================================
+
+var_res <- VAR(
+  y = data_var,
+  p = p_var,
+  type = "const"
+)
+
+cat("\n===== HASIL ESTIMASI VAR =====\n")
+
+print(summary(var_res))
+
+# ============================================
+# SIMPAN RESIDUAL
+# ============================================
+
+residuals_var <- residuals(var_res)
+
+cat("\nDimensi residual VAR:\n")
+print(dim(residuals_var))
+
+```
+
+```{r}
+# ============================================
+# (B) VAR BASELINE DAN DIAGNOSTIK RESIDUAL
+#     Lag final = 1 berdasarkan BIC/SC dan HQ
+# ============================================
+
+library(vars)
+library(dplyr)
+
+# ============================================
+# 1. DATA VAR
+# ============================================
+
+data_var <- returns_mat %>%
+  dplyr::select(-Date) %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), as.numeric)) %>%
+  na.omit() %>%
+  dplyr::filter(dplyr::if_all(dplyr::everything(), is.finite))
+
+cat("============================================\n")
+cat("DATA UNTUK VAR\n")
+cat("============================================\n")
+cat("Jumlah observasi VAR :", nrow(data_var), "\n")
+cat("Jumlah variabel      :", ncol(data_var), "\n")
+print(head(data_var))
+
+
+# ============================================
+# 2. PEMILIHAN LAG OPTIMAL
+# ============================================
+
+lag_res <- VARselect(
+  y = data_var,
+  lag.max = 12,
+  type = "const"
+)
+
+cat("\n============================================\n")
+cat("PEMILIHAN LAG OPTIMAL VAR\n")
+cat("============================================\n")
+print(lag_res)
+
+cat("\nLag optimal berdasarkan masing-masing kriteria:\n")
+print(lag_res$selection)
+
+
+# ============================================
+# 3. LAG FINAL
+#    Dipilih berdasarkan BIC/SC dan HQ
+#    serta konsistensi dengan model MS-VAR
+# ============================================
+
+p_var <- 1
+
+cat("\n============================================\n")
+cat("LAG FINAL VAR\n")
+cat("============================================\n")
+cat("Lag VAR final yang digunakan:", p_var, "\n")
+cat("Dasar pemilihan: BIC/SC dan HQ, serta konsistensi dengan MS-VAR final.\n")
+
+
+# ============================================
+# 4. ESTIMASI VAR BASELINE
+# ============================================
+
+var_res <- VAR(
+  y = data_var,
+  p = p_var,
+  type = "const"
+)
+
+cat("\n============================================\n")
+cat("HASIL ESTIMASI VAR BASELINE\n")
+cat("============================================\n")
+print(summary(var_res))
+
+
+# ============================================
+# 5. SIMPAN RESIDUAL VAR
+# ============================================
+
+residuals_var <- residuals(var_res)
+
+cat("\n============================================\n")
+cat("DIMENSI RESIDUAL VAR\n")
+cat("============================================\n")
+print(dim(residuals_var))
+
+
+# ============================================
+# 6. DIAGNOSTIK RESIDUAL VAR
+# ============================================
+
+# Lag diagnostik residual
+# Dipakai lebih besar dari lag model agar autokorelasi residual bisa terlihat.
+lag_diag <- 12
+
+cat("\n============================================\n")
+cat("DIAGNOSTIK RESIDUAL VAR\n")
+cat("============================================\n")
+cat("Lag VAR final       :", p_var, "\n")
+cat("Lag diagnostik      :", lag_diag, "\n")
+```
+
+
+
+```{r}
+# ============================================
+# (F) BDS TEST (NON-LINEARITY)
+# ============================================
+library(tseries)
+
+cat("\n=== BDS TEST (NON-LINEARITY) ===\n")
+
+for (j in 1:ncol(residuals_var)) {
+  colname <- colnames(residuals_var)[j]
+  bds_res <- bds.test(na.omit(as.numeric(residuals_var[, j])), m = 3)
+  cat("\nResidual", colname, "\n")
+  print(bds_res)
+}
+```
+
+```{r}
+# ============================================
+# UJI KAUSALITAS GRANGER
+# SESUAI TEORI: PER PASANGAN VARIABEL
+# ============================================
+library(lmtest)
+
+cat("\n=== UJI KAUSALITAS GRANGER ===\n")
+cat("Lag yang digunakan:", p_var, "\n")
+
+granger_result <- data.frame(
+  Variabel_X = character(),
+  Variabel_Y = character(),
+  Lag = integer(),
+  F_statistic = numeric(),
+  P_value = numeric(),
+  Keputusan = character(),
+  stringsAsFactors = FALSE
+)
+
+vars_name <- colnames(data_var)
+
+for (y in vars_name) {
+  for (x in vars_name) {
+    if (x != y) {
+      gt <- grangertest(
+        as.formula(paste(y, "~", x)),
+        order = p_var,
+        data = data_var
+      )
+      
+      granger_result <- rbind(
+        granger_result,
+        data.frame(
+          Variabel_X = x,
+          Variabel_Y = y,
+          Lag = p_var,
+          F_statistic = gt$F[2],
+          P_value = gt$`Pr(>F)`[2],
+          Keputusan = ifelse(gt$`Pr(>F)`[2] < 0.05, "Tolak H0", "Gagal Tolak H0")
+        )
+      )
+    }
+  }
+}
+
+print(granger_result)
+```
+
+
+```{r}
+# ============================================================
+# 2. CUMULATIVE RESIDUAL RETURN: IHSG, EMAS, BITCOIN
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Data long untuk cumulative residual semua aset
+cumres_all <- returns_mat %>%
+  dplyr::arrange(Date) %>%
+  dplyr::select(Date, ihsg, gold, btc) %>%
+  dplyr::filter(
+    !is.na(Date),
+    dplyr::if_all(c(ihsg, gold, btc), ~ !is.na(.) & is.finite(.))
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(ihsg, gold, btc),
+    names_to = "Asset",
+    values_to = "Return"
+  ) %>%
+  dplyr::mutate(
+    Asset = dplyr::recode(
+      Asset,
+      ihsg = "IHSG",
+      gold = "Emas",
+      btc  = "Bitcoin"
+    ),
+    Asset = factor(Asset, levels = c("IHSG", "Emas", "Bitcoin"))
+  ) %>%
+  dplyr::group_by(Asset) %>%
+  dplyr::arrange(Date, .by_group = TRUE) %>%
+  dplyr::mutate(
+    mean_return = mean(Return, na.rm = TRUE),
+    resid_mu = Return - mean_return,
+    S_t = cumsum(resid_mu),
+    S_t_sq = S_t^2,
+    kontribusi_S = S_t_sq / sum(S_t_sq, na.rm = TRUE)
+  ) %>%
+  dplyr::ungroup()
+
+# ============================================================
+# RINGKASAN CUMULATIVE RESIDUAL PER ASET
+# ============================================================
+
+summary_cumres_all <- cumres_all %>%
+  dplyr::group_by(Asset) %>%
+  dplyr::summarise(
+    Min_S_t = min(S_t, na.rm = TRUE),
+    Q1_S_t = quantile(S_t, 0.25, na.rm = TRUE),
+    Median_S_t = median(S_t, na.rm = TRUE),
+    Mean_S_t = mean(S_t, na.rm = TRUE),
+    Q3_S_t = quantile(S_t, 0.75, na.rm = TRUE),
+    Max_S_t = max(S_t, na.rm = TRUE),
+    Max_Abs_S_t = max(abs(S_t), na.rm = TRUE),
+    Sum_S_t_Square = sum(S_t_sq, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\n=== RINGKASAN CUMULATIVE RESIDUAL IHSG, EMAS, BITCOIN ===\n")
+print(summary_cumres_all)
+
+# ============================================================
+# 15 TANGGAL KONTRIBUSI CUMULATIVE RESIDUAL TERBESAR PER ASET
+# ============================================================
+
+top_cumres_all <- cumres_all %>%
+  dplyr::group_by(Asset) %>%
+  dplyr::arrange(desc(kontribusi_S), .by_group = TRUE) %>%
+  dplyr::slice_head(n = 15) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(Asset, Date, Return, resid_mu, S_t, kontribusi_S)
+
+cat("\n=== 15 TANGGAL KONTRIBUSI CUMULATIVE RESIDUAL TERBESAR PER ASET ===\n")
+print(top_cumres_all)
+
+# ============================================================
+# GRAFIK PEMBANDING CUMULATIVE RESIDUAL
+# ============================================================
+
+p_cumres_all <- ggplot(cumres_all, aes(x = Date, y = S_t)) +
+  geom_line(linewidth = 0.35) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_wrap(~Asset, scales = "free_y", ncol = 1) +
+  labs(
+    x = "Tanggal",
+    y = "Cumulative Residual",
+    title = "Perbandingan Cumulative Residual Return"
+  ) +
+  theme_minimal()
+
+print(p_cumres_all)
+
+# ============================================================
+#CUMULATIVE RESIDUAL DALAM SATU PANEL
+# ============================================================
+
+p_cumres_overlay <- ggplot(cumres_all, aes(x = Date, y = S_t, color = Asset)) +
+  geom_line(linewidth = 0.35, alpha = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Tanggal",
+    y = "Cumulative Residual",
+    color = "Aset",
+    title = "Overlay Cumulative Residual Return"
+  ) +
+  theme_minimal()
+
+print(p_cumres_overlay)
+```
